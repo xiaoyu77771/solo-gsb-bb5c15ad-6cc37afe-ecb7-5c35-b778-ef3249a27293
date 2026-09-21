@@ -1,4 +1,4 @@
-"""FastAPI 入口：展开、分页展开与结构校验接口。"""
+"""FastAPI 入口：展开、分页展开、时间轴与结构校验接口。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from .models import (
     ExpandResponse,
     Issue,
     Step,
+    TimelineRequest,
+    TimelineResponse,
     ValidateResponse,
 )
 from .pagination import (
@@ -24,6 +26,7 @@ from .pagination import (
     encode_cursor,
     measures_fingerprint,
 )
+from .timeline import build_timeline, check_timeline_values
 
 settings = get_settings()
 
@@ -33,7 +36,8 @@ app = FastAPI(
     description=(
         "提交按小节排列的结构标记（成对反复、第一/第二结尾、"
         "D.C./D.S. al Coda/Fine），返回按演奏语义展开的实际小节序列。"
-        "支持一次性展开与无状态分页展开（签名游标续页）。"
+        "支持一次性展开、无状态分页展开（签名游标续页），"
+        "以及把演奏路径换算为毫秒时间轴（拍数 + 速度标记）。"
     ),
 )
 
@@ -281,5 +285,34 @@ def do_expand_page(req: ExpandPageRequest):
         ],
         done=state.done,
         next_cursor=next_cursor,
+        warnings=[_issue(w).model_dump(exclude_none=True) for w in analysis.warnings],  # type: ignore[list-item]
+    )
+
+
+@app.post("/api/v1/timeline", response_model=TimelineResponse)
+def do_timeline(req: TimelineRequest):
+    """把实际演奏路径换算为毫秒时间轴。
+
+    复用与 ``/expand`` 相同的结构校验与展开语义；每个小节须给出正数
+    ``beats``，首小节必须给出 ``tempo_bpm``。速度标记自所在小节起生效，
+    反复或 D.C./D.S. 再次经过时重新生效。毫秒只在输出时四舍五入，
+    内部累计不逐步取整。非法节拍/速度、结构错误或展开超限均返回带
+    小节定位的 422，且不产出部分时间轴。
+    """
+    value_errors = check_timeline_values(req.measures)
+    if value_errors:
+        return _error_response(value_errors)  # type: ignore[return-value]
+
+    max_steps = req.max_steps or settings.default_max_steps
+    checked = _check_expandable(req.measures, max_steps)
+    if isinstance(checked, JSONResponse):
+        return checked  # type: ignore[return-value]
+    analysis: Analysis = checked
+
+    played = expand(analysis, max_steps=max_steps)
+    steps, total_ms = build_timeline(req.measures, played)
+    return TimelineResponse(
+        steps=steps,
+        total_duration_ms=total_ms,
         warnings=[_issue(w).model_dump(exclude_none=True) for w in analysis.warnings],  # type: ignore[list-item]
     )

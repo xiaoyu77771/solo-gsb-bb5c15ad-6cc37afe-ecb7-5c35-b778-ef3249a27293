@@ -76,6 +76,44 @@ class ExpandRequest(BaseModel):
     )
 
 
+class TimelineMeasure(Measure):
+    """时间轴接口的小节：结构标记之外增加拍数与可选速度标记。
+
+    ``beats`` / ``tempo_bpm`` 的正数约束由服务端以带小节定位的 422 校验
+    （不使用 Pydantic 约束，保证错误格式与结构错误一致）。
+    """
+
+    beats: float = Field(..., description="该小节的拍数，必须为正数")
+    tempo_bpm: Optional[float] = Field(
+        default=None,
+        description="速度标记（BPM，正数）；首小节必须给出，反复/D.C./D.S. 再次经过时重新生效",
+    )
+
+
+class TimelineRequest(BaseModel):
+    """时间轴接口请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    measures: list[TimelineMeasure] = Field(
+        ..., min_length=1, description="按小节排列的结构标记 + 拍数/速度"
+    )
+    max_steps: Optional[PositiveInt] = Field(
+        default=10000,
+        description="允许的最大展开步数（默认 10000，服务端硬上限由 MAX_EXPANSION_STEPS 配置）",
+    )
+
+
+class TimelineStep(BaseModel):
+    """时间轴上的一个演奏步骤。"""
+
+    occurrence: int = Field(..., description="该小节第几次被演奏（从 1 开始）")
+    measure: int = Field(..., description="原始小节号")
+    start_ms: int = Field(..., description="该步起始毫秒（输出时四舍五入）")
+    end_ms: int = Field(..., description="该步结束毫秒（输出时四舍五入）")
+    tempo_bpm: float = Field(..., description="该步实际生效的速度（BPM）")
+
+
 class Step(BaseModel):
     """展开结果中的一个演奏步骤。"""
 
@@ -128,6 +166,12 @@ class ExpandResponse(BaseModel):
     sequence: list[int] = Field(..., description="实际演奏的原始小节号序列")
     steps: list[Step]
     total_steps: int
+    warnings: list[Issue] = Field(default_factory=list)
+
+
+class TimelineResponse(BaseModel):
+    steps: list[TimelineStep]
+    total_duration_ms: int = Field(..., description="全曲总时长（毫秒，输出时四舍五入）")
     warnings: list[Issue] = Field(default_factory=list)
 
 

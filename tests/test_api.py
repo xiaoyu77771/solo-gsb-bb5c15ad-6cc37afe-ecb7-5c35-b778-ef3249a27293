@@ -640,3 +640,208 @@ def test_expand_page_warnings_carried_on_pages():
         json={**score_nested_volta_ds_al_coda(), "page_size": 4},
     ).json()
     assert any(w["code"] == "UNREACHABLE_MEASURES" for w in body["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# 时间轴 /api/v1/timeline
+# ---------------------------------------------------------------------------
+
+
+def tl(measures: list[dict], **extra) -> dict:
+    """构造时间轴请求：measures 需自带 measure/beats（首小节另需 tempo_bpm）。"""
+    return {"measures": measures, **extra}
+
+
+def test_timeline_basic():
+    data = tl(
+        [
+            {"measure": 1, "beats": 2, "tempo_bpm": 120},
+            {"measure": 2, "beats": 3},
+            {"measure": 3, "beats": 4},
+        ]
+    )
+    r = client.post("/api/v1/timeline", json=data)
+    assert r.status_code == 200
+    body = r.json()
+    # 120 BPM -> 每拍 500ms
+    assert [(s["start_ms"], s["end_ms"]) for s in body["steps"]] == [
+        (0, 1000),
+        (1000, 2500),
+        (2500, 4500),
+    ]
+    assert [s["measure"] for s in body["steps"]] == [1, 2, 3]
+    assert [s["occurrence"] for s in body["steps"]] == [1, 1, 1]
+    assert [s["tempo_bpm"] for s in body["steps"]] == [120, 120, 120]
+    assert body["total_duration_ms"] == 4500
+    assert body["warnings"] == []
+
+
+def test_timeline_repeat_occurrence_and_tempo_reapplied():
+    # 反复段内速度标记在第二遍重新生效
+    data = tl(
+        [
+            {"measure": 1, "beats": 1, "tempo_bpm": 120, "repeat_start": True},
+            {"measure": 2, "beats": 1, "tempo_bpm": 60},
+            {"measure": 3, "beats": 1, "repeat_end": True},
+        ]
+    )
+    body = client.post("/api/v1/timeline", json=data).json()
+    assert [s["measure"] for s in body["steps"]] == [1, 2, 3, 1, 2, 3]
+    assert [s["occurrence"] for s in body["steps"]] == [1, 1, 1, 2, 2, 2]
+    assert [s["tempo_bpm"] for s in body["steps"]] == [120, 60, 60, 120, 60, 60]
+    # 500 / 1000 / 1000 / 500 / 1000 / 1000 ms
+    assert [(s["start_ms"], s["end_ms"]) for s in body["steps"]] == [
+        (0, 500),
+        (500, 1500),
+        (1500, 2500),
+        (2500, 3000),
+        (3000, 4000),
+        (4000, 5000),
+    ]
+    assert body["total_duration_ms"] == 5000
+
+
+def test_timeline_tempo_reapplied_after_dc():
+    data = tl(
+        [
+            {"measure": 1, "beats": 1, "tempo_bpm": 120},
+            {"measure": 2, "beats": 1, "tempo_bpm": 90, "fine": True},
+            {"measure": 3, "beats": 1, "navigation": "dc_al_fine"},
+        ]
+    )
+    body = client.post("/api/v1/timeline", json=data).json()
+    assert [s["measure"] for s in body["steps"]] == [1, 2, 3, 1, 2]
+    assert [s["occurrence"] for s in body["steps"]] == [1, 1, 1, 2, 2]
+    # D.C. 折返后再次经过第 1 小节的速度标记，恢复 120
+    assert [s["tempo_bpm"] for s in body["steps"]] == [120, 90, 90, 120, 90]
+    assert body["total_duration_ms"] == 3000  # 500 + 3 * 666.67 + 500
+
+
+def test_timeline_first_second_ending():
+    data = tl(
+        [
+            {"measure": 1, "beats": 2, "tempo_bpm": 120, "repeat_start": True},
+            {
+                "measure": 2,
+                "beats": 2,
+                "ending_start": True,
+                "ending_number": 1,
+                "ending_stop": True,
+                "repeat_end": True,
+            },
+            {
+                "measure": 3,
+                "beats": 2,
+                "ending_start": True,
+                "ending_number": 2,
+                "ending_stop": True,
+            },
+        ]
+    )
+    body = client.post("/api/v1/timeline", json=data).json()
+    assert [s["measure"] for s in body["steps"]] == [1, 2, 1, 3]
+    assert [s["occurrence"] for s in body["steps"]] == [1, 1, 2, 1]
+    assert [(s["start_ms"], s["end_ms"]) for s in body["steps"]] == [
+        (0, 1000),
+        (1000, 2000),
+        (2000, 3000),
+        (3000, 4000),
+    ]
+
+
+def test_timeline_no_per_step_rounding():
+    # 每小节 60000/7 ≈ 8571.428571ms：内部累计不取整，仅输出四舍五入
+    data = tl(
+        [
+            {"measure": 1, "beats": 1, "tempo_bpm": 7},
+            {"measure": 2, "beats": 1},
+            {"measure": 3, "beats": 1},
+        ]
+    )
+    body = client.post("/api/v1/timeline", json=data).json()
+    assert [(s["start_ms"], s["end_ms"]) for s in body["steps"]] == [
+        (0, 8571),
+        (8571, 17143),  # 逐步取整会得到 17142
+        (17143, 25714),
+    ]
+    assert body["total_duration_ms"] == 25714  # 逐步取整会得到 25713
+
+
+def test_timeline_invalid_beats():
+    for bad in (0, -1, -2.5):
+        data = tl(
+            [
+                {"measure": 1, "beats": 4, "tempo_bpm": 120},
+                {"measure": 2, "beats": bad},
+            ]
+        )
+        r = client.post("/api/v1/timeline", json=data)
+        assert r.status_code == 422
+        detail = r.json()["detail"]
+        assert detail[0]["code"] == "INVALID_BEATS"
+        assert detail[0]["measure"] == 2
+        assert "steps" not in r.json()
+
+
+def test_timeline_invalid_tempo():
+    data = tl([{"measure": 1, "beats": 4, "tempo_bpm": -60}])
+    r = client.post("/api/v1/timeline", json=data)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "INVALID_TEMPO"
+    assert detail[0]["measure"] == 1
+    assert "steps" not in r.json()
+
+
+def test_timeline_first_measure_tempo_required():
+    data = tl(
+        [
+            {"measure": 1, "beats": 4},
+            {"measure": 2, "beats": 4, "tempo_bpm": 120},
+        ]
+    )
+    r = client.post("/api/v1/timeline", json=data)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "TEMPO_REQUIRED"
+    assert detail[0]["measure"] == 1
+
+
+def test_timeline_structural_error_no_partial_timeline():
+    data = tl(
+        [
+            {"measure": 1, "beats": 4, "tempo_bpm": 120, "repeat_start": True},
+            {"measure": 2, "beats": 4},
+        ]
+    )
+    r = client.post("/api/v1/timeline", json=data)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "UNCLOSED_REPEAT"
+    assert "steps" not in r.json()
+    assert "total_duration_ms" not in r.json()
+
+
+def test_timeline_max_steps_exceeded():
+    data = tl(
+        [
+            {"measure": 1, "beats": 4, "tempo_bpm": 120,
+             "repeat_start": True, "repeat_times": 99},
+            {"measure": 2, "beats": 4, "repeat_end": True},
+        ],
+        max_steps=10,
+    )
+    r = client.post("/api/v1/timeline", json=data)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "MAX_STEPS_EXCEEDED"
+    assert "measure" in detail[0]
+    assert "steps" not in r.json()
+
+
+def test_timeline_keeps_existing_endpoints_compatible():
+    # 既有接口不接受时间轴字段（extra=forbid），行为保持不变
+    r = client.post(
+        "/api/v1/expand",
+        json={"measures": [{"measure": 1, "beats": 4}]},
+    )
+    assert r.status_code == 422
