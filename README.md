@@ -13,10 +13,12 @@
 
 - `POST /api/v1/expand` —— 一次性展开整曲；
 - `POST /api/v1/expand-page` —— 无状态分页展开：首页携带 `page_size`，
-  后续凭签名游标 `next_cursor` 续页，拼接结果与一次性展开**逐步一致**。
+  后续凭签名游标 `next_cursor` 续页，拼接结果与一次性展开**逐步一致**；
+- `POST /api/v1/timeline` —— 在展开语义之上，按每小节的 `beats` 与
+  `tempo_bpm` 把实际演奏路径换算为**毫秒时间轴**。
 
-遇到**未闭合反复、非法跳转、超过最大展开步数**等问题时，返回带**小节定位**的
-422 错误，且**不产出任何部分序列**。
+遇到**未闭合反复、非法跳转、非法节拍/速度、超过最大展开步数**等问题时，
+返回带**小节定位**的 422 错误，且**不产出任何部分序列/时间轴**。
 
 ## 一条命令启动
 
@@ -26,12 +28,36 @@
 docker compose up --build
 ```
 
+也可后台运行并查看日志：
+
+```bash
+docker compose up --build -d
+docker compose logs -f
+```
+
 启动完成后访问：
 
 - 服务地址与端口：<http://localhost:8000>
 - 健康检查：<http://localhost:8000/health>
 - 交互式 API 文档（Swagger UI）：<http://localhost:8000/docs>
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
+
+容器内已按 `Dockerfile` 完成全部依赖装配（`pip install -r requirements.txt`），
+由 uvicorn 直接监听 `0.0.0.0:8000`；compose 自带健康检查（轮询 `/health`），
+`docker compose ps` 显示 `healthy` 即就绪。快速验证时间轴接口：
+
+```bash
+curl -s http://localhost:8000/api/v1/timeline \
+  -H 'Content-Type: application/json' \
+  -d '{"measures":[{"measure":1,"beats":4,"tempo_bpm":120},{"measure":2,"beats":4}]}'
+# => {"steps":[...],"total_duration_ms":4000,"warnings":[]}
+```
+
+停止与清理：
+
+```bash
+docker compose down
+```
 
 本地无 Docker 时也可直接运行：
 
@@ -194,6 +220,59 @@ curl -s http://localhost:8000/api/v1/expand-page \
 其余错误（结构非法、`MAX_STEPS_EXCEEDED` 等）与 `/expand` 完全一致。
 
 
+### `POST /api/v1/timeline` — 演奏时间轴
+
+在 `/expand` 相同的结构校验与展开语义之上，把实际演奏路径换算为毫秒时间轴。
+请求体在 `measures` 的每个小节上额外携带：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `beats` | number > 0 | 该小节的拍数（**每小节必填**，可为小数，如 3.5） |
+| `tempo_bpm` | number > 0 | 速度标记（拍/分钟）；**首小节必填**作为初始速度，之后省略表示沿用当前速度 |
+
+速度语义：每当演奏路径经过带 `tempo_bpm` 的小节（包括反复、`D.C./D.S.`
+折返后**再次经过**），该速度从该小节起重新生效；每步时长 =
+`beats × 60000 / tempo_bpm` 毫秒。
+
+```bash
+curl -s http://localhost:8000/api/v1/timeline \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "measures": [
+      {"measure": 1, "beats": 4, "tempo_bpm": 120, "repeat_start": true},
+      {"measure": 2, "beats": 4},
+      {"measure": 3, "beats": 2, "tempo_bpm": 90, "repeat_end": true}
+    ]
+  }'
+```
+
+响应按演奏步骤返回 `occurrence`（该小节第几次被演奏）、`measure`、
+`start_ms`、`end_ms`、`tempo_bpm`（该步生效的速度），并给出
+`total_duration_ms`：
+
+```json
+{
+  "steps": [
+    {"occurrence": 1, "measure": 1, "start_ms": 0, "end_ms": 2000, "tempo_bpm": 120.0},
+    {"occurrence": 1, "measure": 2, "start_ms": 2000, "end_ms": 4000, "tempo_bpm": 120.0},
+    {"occurrence": 1, "measure": 3, "start_ms": 4000, "end_ms": 5333, "tempo_bpm": 90.0},
+    {"occurrence": 2, "measure": 1, "start_ms": 5333, "end_ms": 7333, "tempo_bpm": 120.0},
+    {"occurrence": 2, "measure": 2, "start_ms": 7333, "end_ms": 9333, "tempo_bpm": 120.0},
+    {"occurrence": 2, "measure": 3, "start_ms": 9333, "end_ms": 10667, "tempo_bpm": 90.0}
+  ],
+  "total_duration_ms": 10667,
+  "warnings": []
+}
+```
+
+精度约定：内部以精确分数累计时长，**不逐步取整**；只有输出
+`start_ms` / `end_ms` / `total_duration_ms` 时才四舍五入到毫秒，
+因此相邻步骤的边界始终首尾相接，总时长等于全程精确时长的一次性取整。
+
+非法节拍或速度（缺失/非正数/非有限值）、首小节缺速度、结构非法、展开超限，
+都返回与 `/expand` 相同格式的 422（`detail` 带 `code` 与 `measure`），
+且**不产出任何部分时间轴**。新增错误码见下表。
+
 ### `POST /api/v1/validate` — 结构校验
 
 请求体与展开接口相同。无论是否合法都返回 **200**，由 `valid` 字段标识，
@@ -244,6 +323,8 @@ curl -s http://localhost:8000/api/v1/validate \
 | `MULTIPLE_NAVIGATION` / `AMBIGUOUS_*` | 多个指令或多个同名目标点 |
 | `MAX_STEPS_EXCEEDED` | 展开步数超过请求的 `max_steps`（错误带当前小节定位） |
 | `MAX_STEPS_TOO_LARGE` | 请求的 `max_steps` 超过服务端硬上限 |
+| `BEATS_MISSING` / `INVALID_BEATS` | 小节缺少 `beats` / `beats` 非正数或非有限值（仅时间轴接口） |
+| `TEMPO_MISSING` / `INVALID_TEMPO` | 首小节缺少 `tempo_bpm` / 速度标记非正数或非有限值（仅时间轴接口） |
 | `CURSOR_INVALID` / `CURSOR_SCORE_MISMATCH` / `CURSOR_PARAM_MISMATCH` | 分页游标被篡改 / 换谱 / 分页参数不一致 |
 | `PAGE_SIZE_REQUIRED` / `PAGE_SIZE_TOO_LARGE` | 首页缺 `page_size` / 超过 `MAX_PAGE_SIZE` |
 
@@ -258,9 +339,10 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由：/api/v1/expand、/api/v1/expand-page、/api/v1/validate、/health
+  main.py       # FastAPI 路由：/api/v1/expand、/api/v1/expand-page、/api/v1/timeline、/api/v1/validate、/health
   analyzer.py   # 静态结构分析：反复段 / 结尾 / 导航标记解析与校验
   expander.py   # 演奏语义虚拟机：生成实际小节序列（VMState 支持断点续页）
+  timeline.py   # 时间轴换算：beats/tempo -> 毫秒（Fraction 精确累计，输出才取整）
   pagination.py # 分页游标：HMAC 签名、乐谱指纹与分页参数绑定
   models.py     # Pydantic 请求/响应模型
   config.py     # 环境变量配置

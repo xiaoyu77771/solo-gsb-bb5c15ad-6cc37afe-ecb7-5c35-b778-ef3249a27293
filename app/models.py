@@ -76,6 +76,36 @@ class ExpandRequest(BaseModel):
     )
 
 
+class TimelineMeasure(Measure):
+    """时间轴接口的小节：在结构标记之外携带拍数与可选速度标记。
+
+    ``beats`` / ``tempo_bpm`` 的取值合法性（正数、有限、首小节必须有速度）
+    由服务端统一校验并返回带小节定位的 422，因此这里不加 Pydantic 约束。
+    """
+
+    beats: Optional[float] = Field(
+        default=None, description="该小节的拍数（正数，必填）"
+    )
+    tempo_bpm: Optional[float] = Field(
+        default=None,
+        description="速度标记（拍/分钟，正数）；首小节必填，反复或 D.C./D.S. 再次经过时重新生效",
+    )
+
+
+class TimelineRequest(BaseModel):
+    """时间轴接口请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    measures: list[TimelineMeasure] = Field(
+        ..., min_length=1, description="按小节排列的结构标记 + 每小节 beats / 可选 tempo_bpm"
+    )
+    max_steps: Optional[PositiveInt] = Field(
+        default=10000,
+        description="允许的最大展开步数（默认 10000，服务端硬上限由 MAX_EXPANSION_STEPS 配置）",
+    )
+
+
 class Step(BaseModel):
     """展开结果中的一个演奏步骤。"""
 
@@ -89,6 +119,22 @@ class Issue(BaseModel):
     code: str
     message: str
     measure: Optional[int] = None
+
+
+class TimelineStep(BaseModel):
+    """时间轴上的一个演奏步骤。"""
+
+    occurrence: int = Field(..., description="该小节第几次被演奏（从 1 开始）")
+    measure: int = Field(..., description="原始小节号")
+    start_ms: int = Field(..., description="该步开始时刻（毫秒，输出时四舍五入）")
+    end_ms: int = Field(..., description="该步结束时刻（毫秒，输出时四舍五入）")
+    tempo_bpm: float = Field(..., description="该步生效的速度（拍/分钟）")
+
+
+class TimelineResponse(BaseModel):
+    steps: list[TimelineStep] = Field(..., description="按演奏顺序排列的时间轴步骤")
+    total_duration_ms: int = Field(..., description="全曲总时长（毫秒，输出时四舍五入）")
+    warnings: list[Issue] = Field(default_factory=list)
 
 
 class ExpandPageRequest(BaseModel):
